@@ -9,6 +9,7 @@ const defaultSettings = {
   enabled: true,
   qdrantUrl: "http://localhost:6333",
   collectionName: "mem",
+  usePerChatCollections: false,
   embeddingProvider: "openai",
   openaiApiKey: "",
   openRouterApiKey: "",
@@ -31,6 +32,11 @@ const defaultSettings = {
   chunkMinSize: 1200,
   chunkMaxSize: 1500,
   chunkTimeout: 30000, // 30 seconds - save chunk if no new messages
+  streamFinalizePollMs: 250,
+  streamFinalizeStableMs: 1200,
+  streamFinalizeMaxWaitMs: 300000,
+  flushAfterAssistant: true,
+  restrictToCurrentChat: true,
 }
 
 let settings = { ...defaultSettings }
@@ -40,6 +46,7 @@ let processingSaveQueue = false
 let messageBuffer = []
 let lastMessageTime = 0
 let chunkTimer = null
+let pendingAssistantFinalize = null
 
 const EMBEDDING_MODEL_OPTIONS = {
   openai: [
@@ -192,20 +199,27 @@ function saveSettings() {
   console.log("[Qdrant Memory] Settings saved")
 }
 
-// Get collection name for a character
-function getCollectionName(characterName) {
-  if (!settings.usePerCharacterCollections) {
-    return settings.collectionName
-  }
-
-  // Sanitize character name for collection name (lowercase, replace spaces/special chars)
-  const sanitized = characterName
+function sanitizeCollectionPart(value) {
+  return value
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, "_")
     .replace(/_+/g, "_")
     .replace(/^_|_$/g, "")
+}
 
-  return `${settings.collectionName}_${sanitized}`
+// Get collection name for a character/chat scope
+function getCollectionName(characterName, chatId) {
+  const parts = [settings.collectionName]
+
+  if (settings.usePerCharacterCollections && characterName) {
+    parts.push(sanitizeCollectionPart(characterName))
+  }
+
+  if (settings.usePerChatCollections && chatId) {
+    parts.push(sanitizeCollectionPart(chatId))
+  }
+
+  return parts.join("_")
 }
 
 // Get embedding dimensions for the selected model
@@ -577,8 +591,8 @@ async function createCollection(collectionName, vectorSize) {
 }
 
 // Ensure collection exists (create if needed)
-async function ensureCollection(characterName, vectorSize) {
-  const collectionName = getCollectionName(characterName)
+async function ensureCollection(characterName, vectorSize, chatId) {
+  const collectionName = getCollectionName(characterName, chatId)
   const { exists, vectorSize: existingSize } = await collectionExists(collectionName)
 
   if (exists) {
@@ -696,17 +710,48 @@ async function generateEmbedding(text) {
 // MEMORY SEARCH AND RETRIEVAL
 // ============================================================================
 
+function normalizeChatId(rawId) {
+  if (!rawId || typeof rawId !== "string") return null
+  return rawId.trim().replace(/\.jsonl$/i, "")
+}
+
+function getCurrentChatId() {
+  const context = getContext() || {}
+
+  const candidates = [
+    context.chatId,
+    context.chat_id,
+    context.chatName,
+    context.chat_name,
+    context.chatFile,
+    context.chat_file,
+    context?.chat_metadata?.file_name,
+    context?.chat_metadata?.title,
+    window.chat_metadata?.file_name,
+    window.chat_metadata?.title,
+  ]
+
+  for (const candidate of candidates) {
+    const normalized = normalizeChatId(candidate)
+    if (normalized) {
+      return normalized
+    }
+  }
+
+  return null
+}
+
 // Search Qdrant for relevant memories
-async function searchMemories(query, characterName) {
+async function searchMemories(query, characterName, chatId) {
   if (!settings.enabled) return []
 
   try {
-    const collectionName = getCollectionName(characterName)
+    const collectionName = getCollectionName(characterName, chatId)
 
     const embedding = await generateEmbedding(query)
     if (!embedding) return []
 
-    const collectionReady = await ensureCollection(characterName, embedding.length)
+    const collectionReady = await ensureCollection(characterName, embedding.length, chatId)
     if (!collectionReady) {
       if (settings.debugMode) {
         console.log(`[Qdrant Memory] Collection not ready: ${collectionName}`)
@@ -756,6 +801,13 @@ async function searchMemories(query, characterName) {
       filterConditions.push({
         key: "character",
         match: { value: characterName },
+      })
+    }
+
+    if (settings.restrictToCurrentChat && chatId) {
+      filterConditions.push({
+        key: "chatId",
+        match: { value: chatId },
       })
     }
 
@@ -887,7 +939,7 @@ function createChunkFromBuffer() {
   }
 }
 
-async function saveChunkToQdrant(chunk, participants) {
+async function saveChunkToQdrant(chunk, participants, chatId) {
   if (!settings.enabled) return false
   if (!chunk || !participants || participants.length === 0) return false
 
@@ -909,14 +961,15 @@ async function saveChunkToQdrant(chunk, participants) {
       timestamp: chunk.timestamp, // Keep original timestamp for filtering
       messageIds: chunk.messageIds.join(","),
       isChunk: true,
+      chatId: chatId || undefined,
     }
 
     // Save to all participant collections
     const savePromises = participants.map(async (characterName) => {
-      const collectionName = getCollectionName(characterName)
+      const collectionName = getCollectionName(characterName, chatId)
 
       // Ensure collection exists
-      const collectionReady = await ensureCollection(characterName, embedding.length)
+      const collectionReady = await ensureCollection(characterName, embedding.length, chatId)
       if (!collectionReady) {
         console.error(`[Qdrant Memory] Cannot save chunk - collection creation failed for ${characterName}`)
         return false
@@ -982,6 +1035,7 @@ async function processMessageBuffer() {
 
   // Get all participants (for group chats)
   const participants = getChatParticipants()
+  const chatId = getCurrentChatId()
 
   if (participants.length === 0) {
     console.error("[Qdrant Memory] No participants found for chunk")
@@ -990,7 +1044,7 @@ async function processMessageBuffer() {
   }
 
   // Save chunk to all participant collections
-  await saveChunkToQdrant(chunk, participants)
+  await saveChunkToQdrant(chunk, participants, chatId)
 
   // Clear buffer after saving
   messageBuffer = []
@@ -1006,8 +1060,17 @@ function bufferMessage(text, characterName, isUser, messageId) {
   if (isUser && !settings.saveUserMessages) return
   if (!isUser && !settings.saveCharacterMessages) return
 
-  // Add to buffer
-  messageBuffer.push({ text, characterName, isUser, messageId })
+  const existingIndex = messageBuffer.findIndex((msg) => msg.messageId === messageId)
+  if (existingIndex !== -1) {
+    const existing = messageBuffer[existingIndex]
+    if (text.length > existing.text.length) {
+      messageBuffer[existingIndex] = { ...existing, text }
+    } else {
+      return
+    }
+  } else {
+    messageBuffer.push({ text, characterName, isUser, messageId })
+  }
   lastMessageTime = Date.now()
 
   // Calculate current buffer size
@@ -1421,8 +1484,6 @@ async function indexCharacterChats() {
 
     $("#qdrant_index_status").text(`Found ${chatFiles.length} chat files`)
 
-    const collectionName = getCollectionName(characterName)
-
     let totalChunks = 0
     let savedChunks = 0
     let skippedChunks = 0
@@ -1432,6 +1493,7 @@ async function indexCharacterChats() {
       if (cancelled) break
 
       const chatFile = chatFiles[i]
+      const chatId = normalizeChatId(chatFile)
       const progress = ((i / chatFiles.length) * 100).toFixed(0)
 
       $("#qdrant_index_progress").css("width", `${progress}%`)
@@ -1451,6 +1513,8 @@ async function indexCharacterChats() {
         if (cancelled) break
 
         // Check if chunk already exists
+        const collectionName = getCollectionName(characterName, chatId)
+
         const exists = await chunkExists(collectionName, chunk.messageIds)
         if (exists) {
           skippedChunks++
@@ -1461,7 +1525,7 @@ async function indexCharacterChats() {
         const participants = [characterName] // For now, just save to current character
 
         // Save chunk
-        const success = await saveChunkToQdrant(chunk, participants)
+        const success = await saveChunkToQdrant(chunk, participants, chatId)
         if (success) {
           savedChunks++
         }
@@ -1528,6 +1592,7 @@ globalThis.qdrantMemoryInterceptor = async (chat, contextSize, abort, type) => {
     }
 
     const query = lastUserMsg.mes
+    const chatId = getCurrentChatId()
 
     if (settings.debugMode) {
       console.log("[Qdrant Memory] Generation interceptor triggered")
@@ -1538,7 +1603,7 @@ globalThis.qdrantMemoryInterceptor = async (chat, contextSize, abort, type) => {
     }
 
     // Search for relevant memories
-    const memories = await searchMemories(query, characterName)
+    const memories = await searchMemories(query, characterName, chatId)
 
     if (memories.length > 0) {
       const memoryText = formatMemories(memories)
@@ -1582,6 +1647,85 @@ globalThis.qdrantMemoryInterceptor = async (chat, contextSize, abort, type) => {
 // AUTOMATIC MEMORY CREATION
 // ============================================================================
 
+function clearPendingAssistantFinalize() {
+  if (pendingAssistantFinalize?.pollTimerId) {
+    clearInterval(pendingAssistantFinalize.pollTimerId)
+  }
+  pendingAssistantFinalize = null
+}
+
+function scheduleFinalizeLastAssistantMessage(messageId, characterName) {
+  const context = getContext()
+  const chat = context.chat || []
+
+  if (chat.length === 0) return
+
+  const lastMessage = chat[chat.length - 1]
+  const initialText = lastMessage?.mes || ""
+
+  clearPendingAssistantFinalize()
+
+  const pollInterval = settings.streamFinalizePollMs || 250
+  const stableMs = settings.streamFinalizeStableMs || 1200
+  const maxWaitMs = settings.streamFinalizeMaxWaitMs || 300000
+
+  pendingAssistantFinalize = {
+    messageId,
+    characterName,
+    startedAt: Date.now(),
+    lastText: initialText,
+    lastChangeAt: Date.now(),
+    pollTimerId: null,
+  }
+
+  const finalizeAssistant = (text, reason) => {
+    bufferMessage(text, characterName, false, messageId)
+
+    if (settings.flushAfterAssistant && messageBuffer.length >= 2) {
+      processMessageBuffer()
+    }
+
+    if (settings.debugMode && reason) {
+      console.log(`[Qdrant Memory] Finalized assistant message (${reason})`)
+    }
+
+    clearPendingAssistantFinalize()
+  }
+
+  pendingAssistantFinalize.pollTimerId = setInterval(() => {
+    const currentContext = getContext()
+    const currentChat = currentContext.chat || []
+    const currentLastMessage = currentChat[currentChat.length - 1] || {}
+    const currentText = currentLastMessage.mes || pendingAssistantFinalize.lastText || ""
+    const now = Date.now()
+
+    if (currentText !== pendingAssistantFinalize.lastText) {
+      pendingAssistantFinalize.lastText = currentText
+      pendingAssistantFinalize.lastChangeAt = now
+    }
+
+    const stableDuration = now - pendingAssistantFinalize.lastChangeAt
+    const totalDuration = now - pendingAssistantFinalize.startedAt
+
+    if (currentLastMessage.is_user) {
+      finalizeAssistant(pendingAssistantFinalize.lastText, "swapped to user message")
+      return
+    }
+
+    if (stableDuration >= stableMs) {
+      finalizeAssistant(pendingAssistantFinalize.lastText, "stable")
+      return
+    }
+
+    if (totalDuration >= maxWaitMs) {
+      if (settings.debugMode) {
+        console.warn("[Qdrant Memory] Max wait reached while finalizing assistant message")
+      }
+      finalizeAssistant(pendingAssistantFinalize.lastText, "max wait reached")
+    }
+  }, pollInterval)
+}
+
 function onMessageSent() {
   if (!settings.enabled) return
   if (!settings.autoSaveMemories) return
@@ -1590,6 +1734,7 @@ function onMessageSent() {
     const context = getContext()
     const chat = context.chat || []
     const characterName = context.name2
+    const chatId = getCurrentChatId()
 
     if (!characterName || chat.length === 0) return
 
@@ -1598,13 +1743,18 @@ function onMessageSent() {
 
     // FIXED: Normalize send_date for messageId
     const normalizedDate = normalizeTimestamp(lastMessage.send_date || Date.now())
-    
+
     // Create a unique ID for this message
-    const messageId = `${characterName}_${normalizedDate}_${chat.length}`
+    const chatPart = chatId ? sanitizeCollectionPart(chatId) : "global"
+    const messageId = `${characterName}_${chatPart}_${normalizedDate}_${chat.length}`
 
     if (lastMessage.mes && lastMessage.mes.trim().length > 0) {
       const isUser = lastMessage.is_user || false
-      bufferMessage(lastMessage.mes, characterName, isUser, messageId)
+      if (isUser) {
+        bufferMessage(lastMessage.mes, characterName, isUser, messageId)
+      } else {
+        scheduleFinalizeLastAssistantMessage(messageId, characterName)
+      }
     }
   } catch (error) {
     console.error("[Qdrant Memory] Error in onMessageSent:", error)
@@ -1647,6 +1797,7 @@ async function deleteCollection(collectionName) {
 async function showMemoryViewer() {
   const context = getContext()
   const characterName = context.name2
+  const chatId = getCurrentChatId()
 
   if (!characterName) {
     const toastr = window.toastr
@@ -1654,7 +1805,7 @@ async function showMemoryViewer() {
     return
   }
 
-  const collectionName = getCollectionName(characterName)
+  const collectionName = getCollectionName(characterName, chatId)
   const info = await getCollectionInfo(collectionName)
 
   if (!info) {
@@ -1921,6 +2072,22 @@ function createSettingsUI() {
                 </label>
                 <small style="color: #666; display: block; margin-left: 30px;">Each character gets their own dedicated collection (recommended)</small>
             </div>
+
+            <div style="margin: 10px 0;">
+                <label style="display: flex; align-items: center; gap: 10px;">
+                    <input type="checkbox" id="qdrant_per_chat" ${settings.usePerChatCollections ? "checked" : ""} />
+                    <strong>Use Per-Chat Collections</strong>
+                </label>
+                <small style="color: #666; display: block; margin-left: 30px;">Create separate collections for each chat file to keep histories isolated</small>
+            </div>
+
+            <div style="margin: 10px 0;">
+                <label style="display: flex; align-items: center; gap: 10px;">
+                    <input type="checkbox" id="qdrant_restrict_chat" ${settings.restrictToCurrentChat ? "checked" : ""} />
+                    Restrict retrieval to current chat
+                </label>
+                <small style="color: #666; display: block; margin-left: 30px;">Only retrieve memories tagged with this chat (prevents cross-chat bleed)</small>
+            </div>
             
             <div style="margin: 10px 0;">
                 <label style="display: flex; align-items: center; gap: 10px;">
@@ -2119,6 +2286,14 @@ function createSettingsUI() {
 
   $("#qdrant_per_character").on("change", function () {
     settings.usePerCharacterCollections = $(this).is(":checked")
+  })
+
+  $("#qdrant_per_chat").on("change", function () {
+    settings.usePerChatCollections = $(this).is(":checked")
+  })
+
+  $("#qdrant_restrict_chat").on("change", function () {
+    settings.restrictToCurrentChat = $(this).is(":checked")
   })
 
   $("#qdrant_auto_save").on("change", function () {
