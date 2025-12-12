@@ -1,4 +1,4 @@
-Please see the original project for instructions. This is purely a fork for personal use with fixes. All credits go to the original author, but feel free to DM me on Discord if you have issues with my fixes: @sunnybeyond
+Please see the original project for instructions. This is purely a fork for personal use with fixes. All credits go to the original author, and feel free to DM me on Discord if you have issues with my fixes: @sunnybeyond
 
 Changelog:
 - Vectors are separated on chat-level instead of character-level if "Use Per-Chat Collections" is turned on. Just like the native SillyTavern extension, but then with all the perks and features this extension has.
