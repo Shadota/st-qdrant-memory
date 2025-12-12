@@ -36,7 +36,6 @@ const defaultSettings = {
   streamFinalizeStableMs: 1200,
   streamFinalizeMaxWaitMs: 300000,
   flushAfterAssistant: true,
-  restrictToCurrentChat: true,
 }
 
 let settings = { ...defaultSettings }
