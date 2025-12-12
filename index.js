@@ -199,18 +199,61 @@ function saveSettings() {
 
 // Get collection name for a character
 function getCollectionName(characterName) {
+  const chatId = getChatIdentifier()
+
   if (!settings.usePerCharacterCollections) {
     return settings.collectionName
   }
 
   // Sanitize character name for collection name (lowercase, replace spaces/special chars)
-  const sanitized = characterName
+  const sanitizedCharacter = sanitizeForCollectionName(characterName)
+
+  if (chatId) {
+    const sanitizedChat = sanitizeForCollectionName(chatId)
+    if (sanitizedChat) {
+      return `${settings.collectionName}_${sanitizedCharacter}_${sanitizedChat}`
+    }
+  }
+
+  return `${settings.collectionName}_${sanitizedCharacter}`
+}
+
+function sanitizeForCollectionName(value) {
+  return String(value || "")
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, "_")
     .replace(/_+/g, "_")
     .replace(/^_|_$/g, "")
+}
 
-  return `${settings.collectionName}_${sanitized}`
+function getChatIdentifier() {
+  const context = getContext() || {}
+
+  const candidates = [
+    context.chatId,
+    context.chat_id,
+    context?.chatMetadata?.chatId,
+    context?.chatMetadata?.chat_id,
+    context?.chat_metadata?.chatId,
+    context?.chat_metadata?.chat_id,
+    context?.metadata?.chatId,
+    context?.metadata?.chat_id,
+    window.chatId,
+    window.chat_id,
+    window?.chatMetadata?.chatId,
+    window?.chatMetadata?.chat_id,
+  ]
+
+  for (const candidate of candidates) {
+    if (candidate != null) {
+      const trimmed = String(candidate).trim()
+      if (trimmed.length > 0) {
+        return trimmed
+      }
+    }
+  }
+
+  return null
 }
 
 // Get embedding dimensions for the selected model
@@ -722,6 +765,7 @@ async function searchMemories(query, characterName) {
     // Get the timestamp from N messages ago to exclude recent context
     const context = getContext()
     const chat = context.chat || []
+    const chatId = getChatIdentifier()
     let timestampThreshold = 0
 
     if (settings.retainRecentMessages > 0 && chat.length > settings.retainRecentMessages) {
@@ -761,6 +805,14 @@ async function searchMemories(query, characterName) {
       filterConditions.push({
         key: "character",
         match: { value: characterName },
+      })
+    }
+
+    // Add chat filter when available
+    if (chatId) {
+      filterConditions.push({
+        key: "chatId",
+        match: { value: chatId },
       })
     }
 
@@ -914,6 +966,11 @@ async function saveChunkToQdrant(chunk, participants) {
       timestamp: chunk.timestamp, // Keep original timestamp for filtering
       messageIds: chunk.messageIds.join(","),
       isChunk: true,
+    }
+
+    const chatId = getChatIdentifier()
+    if (chatId) {
+      payload.chatId = chatId
     }
 
     // Save to all participant collections
@@ -2014,9 +2071,9 @@ function createSettingsUI() {
             <div style="margin: 10px 0;">
                 <label style="display: flex; align-items: center; gap: 10px;">
                     <input type="checkbox" id="qdrant_per_character" ${settings.usePerCharacterCollections ? "checked" : ""} />
-                    <strong>Use Per-Character Collections</strong>
+                    <strong>Use Per-Chat Collections</strong>
                 </label>
-                <small style="color: #666; display: block; margin-left: 30px;">Each character gets their own dedicated collection (recommended)</small>
+                <small style="color: #666; display: block; margin-left: 30px;">Each chat and character pair gets their own dedicated collection (recommended)</small>
             </div>
             
             <div style="margin: 10px 0;">
