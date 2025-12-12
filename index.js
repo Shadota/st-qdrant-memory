@@ -31,6 +31,10 @@ const defaultSettings = {
   chunkMinSize: 1200,
   chunkMaxSize: 1500,
   chunkTimeout: 30000, // 30 seconds - save chunk if no new messages
+  streamFinalizePollMs: 250,
+  streamFinalizeStableMs: 1200,
+  streamFinalizeMaxWaitMs: 300000,
+  flushAfterAssistant: true,
 }
 
 let settings = { ...defaultSettings }
@@ -40,6 +44,7 @@ let processingSaveQueue = false
 let messageBuffer = []
 let lastMessageTime = 0
 let chunkTimer = null
+let pendingAssistantFinalize = null
 
 const EMBEDDING_MODEL_OPTIONS = {
   openai: [
@@ -1006,8 +1011,17 @@ function bufferMessage(text, characterName, isUser, messageId) {
   if (isUser && !settings.saveUserMessages) return
   if (!isUser && !settings.saveCharacterMessages) return
 
-  // Add to buffer
-  messageBuffer.push({ text, characterName, isUser, messageId })
+  const existingIndex = messageBuffer.findIndex((msg) => msg.messageId === messageId)
+  if (existingIndex !== -1) {
+    const existing = messageBuffer[existingIndex]
+    if (text.length > existing.text.length) {
+      messageBuffer[existingIndex] = { ...existing, text }
+    } else {
+      return
+    }
+  } else {
+    messageBuffer.push({ text, characterName, isUser, messageId })
+  }
   lastMessageTime = Date.now()
 
   // Calculate current buffer size
@@ -1582,6 +1596,85 @@ globalThis.qdrantMemoryInterceptor = async (chat, contextSize, abort, type) => {
 // AUTOMATIC MEMORY CREATION
 // ============================================================================
 
+function clearPendingAssistantFinalize() {
+  if (pendingAssistantFinalize?.pollTimerId) {
+    clearInterval(pendingAssistantFinalize.pollTimerId)
+  }
+  pendingAssistantFinalize = null
+}
+
+function scheduleFinalizeLastAssistantMessage(messageId, characterName) {
+  const context = getContext()
+  const chat = context.chat || []
+
+  if (chat.length === 0) return
+
+  const lastMessage = chat[chat.length - 1]
+  const initialText = lastMessage?.mes || ""
+
+  clearPendingAssistantFinalize()
+
+  const pollInterval = settings.streamFinalizePollMs || 250
+  const stableMs = settings.streamFinalizeStableMs || 1200
+  const maxWaitMs = settings.streamFinalizeMaxWaitMs || 300000
+
+  pendingAssistantFinalize = {
+    messageId,
+    characterName,
+    startedAt: Date.now(),
+    lastText: initialText,
+    lastChangeAt: Date.now(),
+    pollTimerId: null,
+  }
+
+  const finalizeAssistant = (text, reason) => {
+    bufferMessage(text, characterName, false, messageId)
+
+    if (settings.flushAfterAssistant && messageBuffer.length >= 2) {
+      processMessageBuffer()
+    }
+
+    if (settings.debugMode && reason) {
+      console.log(`[Qdrant Memory] Finalized assistant message (${reason})`)
+    }
+
+    clearPendingAssistantFinalize()
+  }
+
+  pendingAssistantFinalize.pollTimerId = setInterval(() => {
+    const currentContext = getContext()
+    const currentChat = currentContext.chat || []
+    const currentLastMessage = currentChat[currentChat.length - 1] || {}
+    const currentText = currentLastMessage.mes || pendingAssistantFinalize.lastText || ""
+    const now = Date.now()
+
+    if (currentText !== pendingAssistantFinalize.lastText) {
+      pendingAssistantFinalize.lastText = currentText
+      pendingAssistantFinalize.lastChangeAt = now
+    }
+
+    const stableDuration = now - pendingAssistantFinalize.lastChangeAt
+    const totalDuration = now - pendingAssistantFinalize.startedAt
+
+    if (currentLastMessage.is_user) {
+      finalizeAssistant(pendingAssistantFinalize.lastText, "swapped to user message")
+      return
+    }
+
+    if (stableDuration >= stableMs) {
+      finalizeAssistant(pendingAssistantFinalize.lastText, "stable")
+      return
+    }
+
+    if (totalDuration >= maxWaitMs) {
+      if (settings.debugMode) {
+        console.warn("[Qdrant Memory] Max wait reached while finalizing assistant message")
+      }
+      finalizeAssistant(pendingAssistantFinalize.lastText, "max wait reached")
+    }
+  }, pollInterval)
+}
+
 function onMessageSent() {
   if (!settings.enabled) return
   if (!settings.autoSaveMemories) return
@@ -1598,13 +1691,17 @@ function onMessageSent() {
 
     // FIXED: Normalize send_date for messageId
     const normalizedDate = normalizeTimestamp(lastMessage.send_date || Date.now())
-    
+
     // Create a unique ID for this message
     const messageId = `${characterName}_${normalizedDate}_${chat.length}`
 
     if (lastMessage.mes && lastMessage.mes.trim().length > 0) {
       const isUser = lastMessage.is_user || false
-      bufferMessage(lastMessage.mes, characterName, isUser, messageId)
+      if (isUser) {
+        bufferMessage(lastMessage.mes, characterName, isUser, messageId)
+      } else {
+        scheduleFinalizeLastAssistantMessage(messageId, characterName)
+      }
     }
   } catch (error) {
     console.error("[Qdrant Memory] Error in onMessageSent:", error)
