@@ -1481,7 +1481,30 @@ async function indexCharacterChats() {
     // Get all chat files for this character
     const chatFiles = await getCharacterChats(characterName)
 
-    if (chatFiles.length === 0) {
+    // If per-chat collections are enabled, only index the current chat
+    let filteredChatFiles = chatFiles
+    if (settings.usePerCharacterCollections) {
+      const chatId = getChatIdentifier()
+      if (chatId) {
+        const normalizedChatId = sanitizeForCollectionName(chatId)
+        filteredChatFiles = chatFiles.filter((file) => {
+          const baseName = String(file || "")
+            .replace(/\.jsonl?$/, "")
+            .trim()
+          const normalizedBase = sanitizeForCollectionName(baseName)
+          return baseName === chatId || normalizedBase === normalizedChatId
+        })
+
+        if (settings.debugMode) {
+          console.log(
+            `[Qdrant Memory] Filtering chat files for current chatId (${chatId}):`,
+            filteredChatFiles,
+          )
+        }
+      }
+    }
+
+    if (filteredChatFiles.length === 0) {
       $("#qdrant_index_status").text("No chat files found")
       setCancelButtonToClose()
       setTimeout(() => {
@@ -1490,7 +1513,7 @@ async function indexCharacterChats() {
       return
     }
 
-    $("#qdrant_index_status").text(`Found ${chatFiles.length} chat files`)
+    $("#qdrant_index_status").text(`Found ${filteredChatFiles.length} chat files`)
 
     const collectionName = getCollectionName(characterName)
 
@@ -1499,14 +1522,14 @@ async function indexCharacterChats() {
     let skippedChunks = 0
 
     // Process each chat file
-    for (let i = 0; i < chatFiles.length; i++) {
+    for (let i = 0; i < filteredChatFiles.length; i++) {
       if (cancelled) break
 
-      const chatFile = chatFiles[i]
-      const progress = ((i / chatFiles.length) * 100).toFixed(0)
+      const chatFile = filteredChatFiles[i]
+      const progress = ((i / filteredChatFiles.length) * 100).toFixed(0)
 
       $("#qdrant_index_progress").css("width", `${progress}%`)
-      $("#qdrant_index_status").text(`Processing chat ${i + 1}/${chatFiles.length}`)
+      $("#qdrant_index_status").text(`Processing chat ${i + 1}/${filteredChatFiles.length}`)
       $("#qdrant_index_details").text(`File: ${chatFile}`)
 
       // Load chat file
