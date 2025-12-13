@@ -910,6 +910,29 @@ function getChatParticipants() {
   return characterName ? [characterName] : []
 }
 
+function getUserDisplayName() {
+  const context = getContext() || {}
+  const candidates = [
+    context.userName,
+    context.username,
+    context.user,
+    context.user_name,
+    context.name1,
+  ]
+
+  if (typeof window !== "undefined") {
+    candidates.push(window.name1, window.username)
+  }
+
+  for (const name of candidates) {
+    if (typeof name === "string" && name.trim()) {
+      return name.trim()
+    }
+  }
+
+  return "You"
+}
+
 function createChunkFromBuffer() {
   if (messageBuffer.length === 0) return null
 
@@ -921,7 +944,7 @@ function createChunkFromBuffer() {
 
   // Build chunk text with speaker labels
   messageBuffer.forEach((msg) => {
-    const speaker = msg.isUser ? "You" : msg.characterName
+    const speaker = msg.isUser ? getUserDisplayName() : msg.characterName
     speakers.add(speaker)
     messageIds.push(msg.messageId)
 
@@ -1374,7 +1397,7 @@ function createChunkFromMessages(messages) {
   let oldestTimestamp = Number.POSITIVE_INFINITY
 
   messages.forEach((msg) => {
-    const speaker = msg.isUser ? "You" : msg.characterName
+    const speaker = msg.isUser ? getUserDisplayName() : msg.characterName
     speakers.add(speaker)
     messageIds.push(msg.messageId)
 
