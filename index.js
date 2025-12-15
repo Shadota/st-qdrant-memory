@@ -1141,10 +1141,27 @@ function addMessageToBuffer(message) {
 }
 
 function releasePendingMessages() {
-  while (pendingMessages.length > settings.messageDelay) {
-    const message = pendingMessages.shift()
-    addMessageToBuffer(message)
-  }
+  const readyMessages = []
+  const stillPending = []
+
+  pendingMessages.forEach((msg) => {
+    if ((msg.remainingDelay ?? settings.messageDelay) <= 0) {
+      readyMessages.push({ text: msg.text, characterName: msg.characterName, isUser: msg.isUser, messageId: msg.messageId })
+    } else {
+      stillPending.push(msg)
+    }
+  })
+
+  pendingMessages = stillPending
+  readyMessages.forEach((msg) => addMessageToBuffer(msg))
+}
+
+function decrementPendingDelays() {
+  pendingMessages = pendingMessages.map((msg) => ({
+    ...msg,
+    remainingDelay: (msg.remainingDelay ?? settings.messageDelay) - 1,
+  }))
+  releasePendingMessages()
 }
 
 function bufferMessage(text, characterName, isUser, messageId) {
@@ -1157,26 +1174,27 @@ function bufferMessage(text, characterName, isUser, messageId) {
   if (isUser && !settings.saveUserMessages) return
   if (!isUser && !settings.saveCharacterMessages) return
 
+  decrementPendingDelays()
+
   const pendingIndex = pendingMessages.findIndex((msg) => msg.messageId === messageId)
   if (pendingIndex !== -1) {
     const existing = pendingMessages[pendingIndex]
     if (text.length > existing.text.length) {
       pendingMessages[pendingIndex] = { ...existing, text }
-    } else {
-      return
     }
-  } else {
-    const existingBufferIndex = messageBuffer.findIndex((msg) => msg.messageId === messageId)
-    if (existingBufferIndex !== -1) {
-      const existing = messageBuffer[existingBufferIndex]
-      if (text.length > existing.text.length) {
-        messageBuffer[existingBufferIndex] = { ...existing, text }
-      }
-    } else {
-      pendingMessages.push({ text, characterName, isUser, messageId })
-    }
+    return
   }
 
+  const existingBufferIndex = messageBuffer.findIndex((msg) => msg.messageId === messageId)
+  if (existingBufferIndex !== -1) {
+    const existing = messageBuffer[existingBufferIndex]
+    if (text.length > existing.text.length) {
+      messageBuffer[existingBufferIndex] = { ...existing, text }
+    }
+    return
+  }
+
+  pendingMessages.push({ text, characterName, isUser, messageId, remainingDelay: settings.messageDelay })
   releasePendingMessages()
 }
 
@@ -2382,6 +2400,10 @@ function createSettingsUI() {
   $("#qdrant_message_delay").on("input", function () {
     settings.messageDelay = Number.parseInt($(this).val())
     $("#message_delay_display").text(settings.messageDelay)
+    pendingMessages = pendingMessages.map((msg) => ({
+      ...msg,
+      remainingDelay: Math.min(msg.remainingDelay ?? settings.messageDelay, settings.messageDelay),
+    }))
     releasePendingMessages()
   })
 
