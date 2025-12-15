@@ -47,6 +47,7 @@ let lastMessageTime = 0
 let chunkTimer = null
 let pendingAssistantFinalize = null
 let pendingMessages = []
+let messageSequence = 0
 
 const EMBEDDING_MODEL_OPTIONS = {
   openai: [
@@ -1140,12 +1141,13 @@ function addMessageToBuffer(message) {
   }
 }
 
-function releasePendingMessages() {
+function releasePendingMessages(currentSequence) {
   const readyMessages = []
   const stillPending = []
 
   pendingMessages.forEach((msg) => {
-    if ((msg.remainingDelay ?? settings.messageDelay) <= 0) {
+    const delay = Number.isFinite(settings.messageDelay) ? settings.messageDelay : defaultSettings.messageDelay
+    if ((currentSequence - msg.sequence) >= delay) {
       readyMessages.push({ text: msg.text, characterName: msg.characterName, isUser: msg.isUser, messageId: msg.messageId })
     } else {
       stillPending.push(msg)
@@ -1154,14 +1156,6 @@ function releasePendingMessages() {
 
   pendingMessages = stillPending
   readyMessages.forEach((msg) => addMessageToBuffer(msg))
-}
-
-function decrementPendingDelays() {
-  pendingMessages = pendingMessages.map((msg) => ({
-    ...msg,
-    remainingDelay: (msg.remainingDelay ?? settings.messageDelay) - 1,
-  }))
-  releasePendingMessages()
 }
 
 function bufferMessage(text, characterName, isUser, messageId) {
@@ -1173,8 +1167,6 @@ function bufferMessage(text, characterName, isUser, messageId) {
   // Check if we should save this type of message
   if (isUser && !settings.saveUserMessages) return
   if (!isUser && !settings.saveCharacterMessages) return
-
-  decrementPendingDelays()
 
   const pendingIndex = pendingMessages.findIndex((msg) => msg.messageId === messageId)
   if (pendingIndex !== -1) {
@@ -1194,8 +1186,9 @@ function bufferMessage(text, characterName, isUser, messageId) {
     return
   }
 
-  pendingMessages.push({ text, characterName, isUser, messageId, remainingDelay: settings.messageDelay })
-  releasePendingMessages()
+  messageSequence += 1
+  pendingMessages.push({ text, characterName, isUser, messageId, sequence: messageSequence })
+  releasePendingMessages(messageSequence)
 }
 
 // ============================================================================
@@ -2400,11 +2393,7 @@ function createSettingsUI() {
   $("#qdrant_message_delay").on("input", function () {
     settings.messageDelay = Number.parseInt($(this).val())
     $("#message_delay_display").text(settings.messageDelay)
-    pendingMessages = pendingMessages.map((msg) => ({
-      ...msg,
-      remainingDelay: Math.min(msg.remainingDelay ?? settings.messageDelay, settings.messageDelay),
-    }))
-    releasePendingMessages()
+    releasePendingMessages(messageSequence)
   })
 
   $("#qdrant_notifications").on("change", function () {
