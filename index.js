@@ -35,6 +35,7 @@ const defaultSettings = {
   streamFinalizeStableMs: 1200,
   streamFinalizeMaxWaitMs: 300000,
   flushAfterAssistant: true,
+  messageDelay: 2,
 }
 
 let settings = { ...defaultSettings }
@@ -45,6 +46,8 @@ let messageBuffer = []
 let lastMessageTime = 0
 let chunkTimer = null
 let pendingAssistantFinalize = null
+let pendingMessages = []
+let messageSequence = 0
 
 const EMBEDDING_MODEL_OPTIONS = {
   openai: [
@@ -1081,27 +1084,19 @@ async function processMessageBuffer() {
   messageBuffer = []
 }
 
-function bufferMessage(text, characterName, isUser, messageId) {
-  if (!settings.enabled) return
-  if (!settings.autoSaveMemories) return
-  if (getEmbeddingProviderError()) return
-  if (text.length < settings.minMessageLength) return
-
-  // Check if we should save this type of message
-  if (isUser && !settings.saveUserMessages) return
-  if (!isUser && !settings.saveCharacterMessages) return
-
-  const existingIndex = messageBuffer.findIndex((msg) => msg.messageId === messageId)
+function addMessageToBuffer(message) {
+  const existingIndex = messageBuffer.findIndex((msg) => msg.messageId === message.messageId)
   if (existingIndex !== -1) {
     const existing = messageBuffer[existingIndex]
-    if (text.length > existing.text.length) {
-      messageBuffer[existingIndex] = { ...existing, text }
+    if (message.text.length > existing.text.length) {
+      messageBuffer[existingIndex] = { ...existing, ...message }
     } else {
       return
     }
   } else {
-    messageBuffer.push({ text, characterName, isUser, messageId })
+    messageBuffer.push(message)
   }
+
   lastMessageTime = Date.now()
 
   // Calculate current buffer size
@@ -1144,6 +1139,56 @@ function bufferMessage(text, characterName, isUser, messageId) {
       processMessageBuffer()
     }, settings.chunkTimeout)
   }
+}
+
+function releasePendingMessages(currentSequence) {
+  const readyMessages = []
+  const stillPending = []
+
+  pendingMessages.forEach((msg) => {
+    const delay = Number.isFinite(settings.messageDelay) ? settings.messageDelay : defaultSettings.messageDelay
+    if ((currentSequence - msg.sequence) >= delay) {
+      readyMessages.push({ text: msg.text, characterName: msg.characterName, isUser: msg.isUser, messageId: msg.messageId })
+    } else {
+      stillPending.push(msg)
+    }
+  })
+
+  pendingMessages = stillPending
+  readyMessages.forEach((msg) => addMessageToBuffer(msg))
+}
+
+function bufferMessage(text, characterName, isUser, messageId) {
+  if (!settings.enabled) return
+  if (!settings.autoSaveMemories) return
+  if (getEmbeddingProviderError()) return
+  if (text.length < settings.minMessageLength) return
+
+  // Check if we should save this type of message
+  if (isUser && !settings.saveUserMessages) return
+  if (!isUser && !settings.saveCharacterMessages) return
+
+  const pendingIndex = pendingMessages.findIndex((msg) => msg.messageId === messageId)
+  if (pendingIndex !== -1) {
+    const existing = pendingMessages[pendingIndex]
+    if (text.length > existing.text.length) {
+      pendingMessages[pendingIndex] = { ...existing, text }
+    }
+    return
+  }
+
+  const existingBufferIndex = messageBuffer.findIndex((msg) => msg.messageId === messageId)
+  if (existingBufferIndex !== -1) {
+    const existing = messageBuffer[existingBufferIndex]
+    if (text.length > existing.text.length) {
+      messageBuffer[existingBufferIndex] = { ...existing, text }
+    }
+    return
+  }
+
+  messageSequence += 1
+  pendingMessages.push({ text, characterName, isUser, messageId, sequence: messageSequence })
+  releasePendingMessages(messageSequence)
 }
 
 // ============================================================================
@@ -2146,13 +2191,20 @@ function createSettingsUI() {
             
             <div style="margin: 10px 0;">
                 <label><strong>Minimum Message Length:</strong> <span id="min_message_length_display">${settings.minMessageLength}</span></label>
-                <input type="range" id="qdrant_min_length" min="5" max="50" value="${settings.minMessageLength}" 
+                <input type="range" id="qdrant_min_length" min="5" max="50" value="${settings.minMessageLength}"
                        style="width: 100%; margin-top: 5px;" />
                 <small style="color: #666;">Minimum characters to save a message</small>
             </div>
-            
+
+            <div style="margin: 10px 0;">
+                <label><strong>Vectorization Delay:</strong> <span id="message_delay_display">${settings.messageDelay}</span> message(s)</label>
+                <input type="range" id="qdrant_message_delay" min="0" max="10" value="${settings.messageDelay}"
+                       style="width: 100%; margin-top: 5px;" />
+                <small style="color: #666;">Number of subsequent messages to wait before embedding</small>
+            </div>
+
             <hr style="margin: 15px 0;" />
-            
+
             <h4>Other Settings</h4>
             
             <div style="margin: 15px 0;">
@@ -2336,6 +2388,12 @@ function createSettingsUI() {
   $("#qdrant_min_length").on("input", function () {
     settings.minMessageLength = Number.parseInt($(this).val())
     $("#min_message_length_display").text(settings.minMessageLength)
+  })
+
+  $("#qdrant_message_delay").on("input", function () {
+    settings.messageDelay = Number.parseInt($(this).val())
+    $("#message_delay_display").text(settings.messageDelay)
+    releasePendingMessages(messageSequence)
   })
 
   $("#qdrant_notifications").on("change", function () {
